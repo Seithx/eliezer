@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import asyncio
 import boto3
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import subprocess
 import logging
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 import threading
 import queue
@@ -37,8 +39,12 @@ class FileLineFormatter(logging.Formatter):
         # Format the log message with file name, line number, thread name, and message
         return f"{filename:<20}:{record.lineno:<4} {self.formatTime(record)} [{record.threadName}] {record.levelname} - {record.getMessage()}"
 
-# Create a file handler that only writes to file
-file_handler = logging.FileHandler('whatsapp_bot.log')
+# On xhost ($PORT is set) log to stdout, which the platform captures as the runtime log;
+# the container disk is ephemeral and an unbounded log file would eventually fill it.
+if os.getenv('PORT'):
+    file_handler = logging.StreamHandler(sys.stdout)
+else:
+    file_handler = logging.FileHandler('whatsapp_bot.log')
 file_handler.setFormatter(FileLineFormatter())
 
 # Create a logger
@@ -71,6 +77,28 @@ def capture_event(distinct_id, event, props=None):
     props["instance_id"] = os.getenv("INSTANCE_ID") or "unknown"
 
     ph.capture(distinct_id=distinct_id, event=event, properties=props)
+
+def start_health_server(port):
+    """Serve 200 on every path so the xhost platform health check passes.
+
+    The bot is a worker with no web surface, but xhost fails a deploy if nothing is
+    listening on $PORT or / returns non-2xx. Started before the bot boots so the check
+    succeeds regardless of how long startup takes.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'ok')
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
+    threading.Thread(target=server.serve_forever, name='Health', daemon=True).start()
+    return server
+
 
 # Timeouts for HTTP requests: (connect_timeout, read_timeout) in seconds
 REQUEST_TIMEOUT = (10, 30)
@@ -1154,6 +1182,12 @@ if __name__ == "__main__":
     parser.add_argument('--overflow-handler', type=int, default=None, metavar='N', help='Only handle jobs when the SQS queue depth exceeds N')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging (verbose output to console and file)')
     args = parser.parse_args()
+
+    # Bind the health port first so xhost's 120s startup check can't race bot init.
+    port = os.getenv('PORT')
+    if port:
+        start_health_server(int(port))
+        logger.info(f"Health server listening on port {port}")
 
     # Resolve worker count: explicit value wins, else 1 locally / 10 remotely.
     num_workers = args.num_workers
